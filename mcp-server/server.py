@@ -8,7 +8,6 @@ import json
 import asyncio
 import argparse
 import hashlib
-import signal
 from pathlib import Path
 
 import chromadb
@@ -193,17 +192,14 @@ class KnowledgeIndex:
         return {"files_added": added, "files_updated": updated, "files_removed": removed}
 
     async def embed_query(self, query: str) -> list[float]:
-        def timeout_handler(signum, frame):
-            raise TimeoutError(f"embed_query 超时 ({EMBED_TIMEOUT}s)")
-
-        # 设置超时
-        signal.signal(signal.SIGALRM, timeout_handler)
-        signal.alarm(EMBED_TIMEOUT)
         try:
-            result = await asyncio.to_thread(self.model.encode, query, show_progress_bar=False)
+            result = await asyncio.wait_for(
+                asyncio.to_thread(self.model.encode, query, show_progress_bar=False),
+                timeout=EMBED_TIMEOUT,
+            )
             return result.tolist()
-        finally:
-            signal.alarm(0)  # 取消闹钟
+        except asyncio.TimeoutError:
+            raise TimeoutError(f"embed_query 超时 ({EMBED_TIMEOUT}s)")
 
 
 args = parse_args()
@@ -259,7 +255,7 @@ async def call_tool(name: str, arguments: dict):
 
     if name == "search_knowledge":
         query = arguments["query"]
-        top_k = arguments.get("top_k", 5)
+        top_k = max(1, min(arguments.get("top_k", 5), 100))  # 限制在 1-100 范围内
         fmt = arguments.get("format", "markdown")
         collection = indexer.get_collection()
         emb = await indexer.embed_query(query)
@@ -432,10 +428,21 @@ def build_starlette_app(token: str | None, transport: str):
         if not token:
             return True
         import secrets
-        headers = {k.decode("latin1").lower(): v.decode("latin1") for k, v in scope.get("headers", [])}
+        try:
+            headers = {k.decode("latin1").lower(): v.decode("latin1") for k, v in scope.get("headers", [])}
+        except UnicodeDecodeError:
+            return False
         auth = headers.get("authorization", "")
         x_token = headers.get("x-mcp-token", "")
-        query_token = dict(scope.get("query_string", b"").decode().split("=") for p in scope.get("root_path", "").split("&") if "=" in p).get("token", "")
+        # 从 query_string 解析 token（而非 root_path）
+        query_string = scope.get("query_string", b"").decode()
+        query_token = None
+        for param in query_string.split("&"):
+            if "=" in param:
+                k, v = param.split("=", 1)
+                if k == "token":
+                    query_token = v
+                    break
         if auth.startswith("Bearer "):
             return secrets.compare_digest(auth.removeprefix("Bearer ").strip(), token)
         if x_token:
